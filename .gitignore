@@ -1,0 +1,83 @@
+# ── Secrets (NEVER commit) ──────────────────────────────────
+.env
+*.key
+*.pem
+*.p12
+secrets/
+
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── Virtual environments ─────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+
+# ── Testing & Coverage ───────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+nosetests.xml
+test-results/
+
+# ── Mypy ────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ── Jupyter ─────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── ML artifacts (large files — use MLflow/S3 instead) ──────
+*.pkl
+*.pickle
+*.joblib
+*.model
+*.pt
+*.pth
+mlruns/
+mlartifacts/
+
+# ── Data files ───────────────────────────────────────────────
+data/
+*.csv
+*.parquet
+*.feather
+*.arrow
+!db/seeds/*.sql
+
+# ── Docker ───────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── IDEs ────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*.DS_Store
+Thumbs.db
+
+# ── Logs ────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS ───────────────────────────────────────────────────────
+.DS_Store
+ehthumbs.db
+Desktop.ini

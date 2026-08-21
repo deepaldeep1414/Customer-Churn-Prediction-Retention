@@ -1,0 +1,14 @@
+# LightGBM default hyperparameters
+algorithm: lightgbm
+n_estimators: 300
+num_leaves: 63
+learning_rate: 0.05
+min_data_in_leaf: 20
+feature_fraction: 0.8
+bagging_fraction: 0.8
+bagging_freq: 5
+reg_alpha: 0.01
+reg_lambda: 0.01
+is_unbalance: true
+verbose: -1
+random_state: 42

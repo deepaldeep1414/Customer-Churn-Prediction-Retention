@@ -1,0 +1,168 @@
+version: "3.9"
+
+# ==============================================================
+# Customer Churn Platform — Local Development Compose
+# ==============================================================
+# Usage:
+#   docker compose up -d                 # Start core services from root
+#   docker compose --profile training up # Also start training worker
+# ==============================================================
+
+services:
+
+  # ─────────────────────────────────────────────────────────────
+  # PostgreSQL 16 — Primary database (raw / curated / ml schemas)
+  # ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: churn_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       churn_db
+      POSTGRES_USER:     churn_admin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Auto-run migrations on first boot (alphabetical order)
+      - ../db/migrations/versions/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql:ro
+      - ../db/migrations/versions/002_roles_and_permissions.sql:/docker-entrypoint-initdb.d/002_roles_and_permissions.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U churn_admin -d churn_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ─────────────────────────────────────────────────────────────
+  # MLflow 2.11 — Experiment tracking + model registry
+  # ─────────────────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.11.0
+    container_name: churn_mlflow
+    restart: unless-stopped
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    volumes:
+      - mlflow_artifacts:/mlflow
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────────────────────
+  # FastAPI Prediction Service
+  # ─────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+    container_name: churn_api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL:    postgresql://api_user:${API_DB_PASSWORD}@postgres:5432/churn_db
+      MLFLOW_URI:      http://mlflow:5000
+      SECRET_KEY:      ${API_SECRET_KEY}
+      MODEL_VERSION:   ${MODEL_VERSION:-latest}
+      RISK_BAND_LOW:   ${RISK_BAND_LOW:-0.30}
+      RISK_BAND_MED:   ${RISK_BAND_MED:-0.55}
+      RISK_BAND_HIGH:  ${RISK_BAND_HIGH:-0.75}
+      LOG_LEVEL:       ${LOG_LEVEL:-info}
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    volumes:
+      - ../apps/api:/app:ro   # Hot-reload in dev; remove :ro for production
+      - mlflow_artifacts:/mlflow
+
+  # ─────────────────────────────────────────────────────────────
+  # Apache Superset — Business Intelligence Dashboard
+  # ─────────────────────────────────────────────────────────────
+  superset:
+    image: apache/superset:3.1.0
+    container_name: churn_superset
+    restart: unless-stopped
+    environment:
+      SUPERSET_SECRET_KEY:   ${SUPERSET_SECRET_KEY}
+      SQLALCHEMY_DATABASE_URI: postgresql://superset_user:${SUPERSET_DB_PASSWORD}@postgres:5432/churn_db
+      PYTHONPATH:            /app/pythonpath
+    volumes:
+      - ../apps/dashboard/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - superset_home:/app/superset_home
+    ports:
+      - "8088:8088"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      bash -c "
+        superset db upgrade &&
+        superset fab create-admin --username admin --firstname Admin --lastname User --email admin@churn.local --password ${SUPERSET_ADMIN_PASSWORD} &&
+        superset init &&
+        gunicorn -w 2 -k gthread --timeout 120 -b 0.0.0.0:8088 'superset.app:create_app()'
+      "
+
+  # ─────────────────────────────────────────────────────────────
+  # Nginx — Reverse proxy + TLS termination (dev: HTTP only)
+  # ─────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: churn_nginx
+    restart: unless-stopped
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+      - superset
+
+  # ─────────────────────────────────────────────────────────────
+  # Training Worker — only starts with --profile training
+  # ─────────────────────────────────────────────────────────────
+  training_worker:
+    build:
+      context: ..
+      dockerfile: ml/Dockerfile.training
+    container_name: churn_training
+    command: tail -f /dev/null
+    profiles:
+      - training
+    environment:
+      DATABASE_URL:    postgresql://ml_user:${ML_DB_PASSWORD}@postgres:5432/churn_db
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_EXPERIMENT_NAME: churn_prediction
+      PYTHONPATH:      /app
+    volumes:
+      - ../ml:/app/ml
+      - ../pipelines:/app/pipelines
+      - mlflow_artifacts:/mlflow
+      - mlflow_artifacts:/mlflow/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  mlflow_artifacts:
+  superset_home:

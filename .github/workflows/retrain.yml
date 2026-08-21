@@ -1,0 +1,240 @@
+name: Scheduled Retraining
+
+on:
+  schedule:
+    # Run on the 1st of every month at 02:00 UTC
+    - cron: "0 2 1 * *"
+  workflow_dispatch:
+    inputs:
+      observation_date:
+        description: "Observation date for training (YYYY-MM-DD)"
+        required: false
+        default: ""
+      force_retrain:
+        description: "Force retrain even if trigger conditions not met"
+        type: boolean
+        default: false
+      run_tuning:
+        description: "Run Optuna hyperparameter tuning (slower)"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  ECR_REGISTRY:   ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  check-triggers:
+    name: Evaluate Retraining Triggers
+    runs-on: ubuntu-latest
+    outputs:
+      should_retrain: ${{ steps.trigger.outputs.should_retrain }}
+      trigger_type:   ${{ steps.trigger.outputs.trigger_type }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install asyncpg numpy
+
+      - name: Check retraining triggers
+        id: trigger
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          REF_DATE=$(date -d "30 days ago" +%Y-%m-%d 2>/dev/null || date -v-30d +%Y-%m-%d)
+          MON_DATE=$(date +%Y-%m-%d)
+
+          if [ "${{ github.event.inputs.force_retrain }}" == "true" ]; then
+            echo "should_retrain=true"  >> $GITHUB_OUTPUT
+            echo "trigger_type=forced"  >> $GITHUB_OUTPUT
+            echo "Force retrain requested — skipping trigger check."
+            exit 0
+          fi
+
+          python pipelines/mlops/retraining_trigger.py \
+            --reference-date "$REF_DATE" \
+            --monitoring-date "$MON_DATE" \
+            --scheduled && \
+            echo "should_retrain=true"  >> $GITHUB_OUTPUT || \
+            echo "should_retrain=false" >> $GITHUB_OUTPUT
+
+          echo "trigger_type=evaluated" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────────────────
+  train:
+    name: Train & Evaluate All Models
+    runs-on: ubuntu-latest
+    needs: check-triggers
+    if: needs.check-triggers.outputs.should_retrain == 'true'
+    environment: training   # Optional approval gate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-deploy
+          aws-region:     us-east-1
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set observation date
+        id: obs
+        run: |
+          if [ -n "${{ github.event.inputs.observation_date }}" ]; then
+            echo "OBS_DATE=${{ github.event.inputs.observation_date }}" >> $GITHUB_ENV
+          else
+            # Use last day of previous month as observation cutoff
+            echo "OBS_DATE=$(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m-%d 2>/dev/null \
+              || date -v-1d -v1d +%Y-%m-%d)" >> $GITHUB_ENV
+          fi
+
+      - name: Run training pipeline (in training worker container)
+        env:
+          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_URI }}
+          AWS_DEFAULT_REGION:  us-east-1
+        run: |
+          TUNING_FLAG=""
+          if [ "${{ github.event.inputs.run_tuning }}" == "true" ]; then
+            TUNING_FLAG="--run-tuning"
+          fi
+
+          docker run --rm \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -e MLFLOW_TRACKING_URI="$MLFLOW_TRACKING_URI" \
+            -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+            -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+            -e AWS_DEFAULT_REGION="$AWS_DEFAULT_REGION" \
+            "${{ env.ECR_REGISTRY }}/churn/training:latest" \
+            python pipelines/training_pipeline.py \
+              --observation-date "$OBS_DATE" \
+              --feature-version v1.0.0 \
+              $TUNING_FLAG | tee /tmp/training_output.json
+
+      - name: Extract candidate version
+        id: candidate
+        run: |
+          CANDIDATE_VERSION=$(cat /tmp/training_output.json | python -c "import sys,json; d=json.load(sys.stdin); print(d['candidate_version'])" 2>/dev/null || echo "unknown")
+          CANDIDATE_RUN_ID=$(cat /tmp/training_output.json | python -c "import sys,json; d=json.load(sys.stdin); print(d['best_run_id'])" 2>/dev/null || echo "unknown")
+          echo "CANDIDATE_VERSION=$CANDIDATE_VERSION" >> $GITHUB_ENV
+          echo "CANDIDATE_RUN_ID=$CANDIDATE_RUN_ID"   >> $GITHUB_ENV
+          echo "candidate_version=$CANDIDATE_VERSION"  >> $GITHUB_OUTPUT
+          echo "candidate_run_id=$CANDIDATE_RUN_ID"    >> $GITHUB_OUTPUT
+
+      - name: Upload training output
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-output-${{ env.OBS_DATE }}
+          path: /tmp/training_output.json
+
+  # ─────────────────────────────────────────────────────────
+  promotion-gate:
+    name: Run Automated Promotion Gates
+    runs-on: ubuntu-latest
+    needs: train
+    if: needs.train.outputs.candidate_version != 'unknown'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install asyncpg mlflow numpy
+
+      - name: Run promotion gates
+        id: gates
+        env:
+          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_URI }}
+          CANDIDATE_RUN_ID:    ${{ needs.train.outputs.candidate_run_id }}
+          CANDIDATE_VERSION:   ${{ needs.train.outputs.candidate_version }}
+        run: |
+          python pipelines/mlops/promotion_gate.py \
+            --candidate-run-id  "$CANDIDATE_RUN_ID"  \
+            --candidate-version "$CANDIDATE_VERSION" \
+            --feature-version   v1.0.0               \
+            --observation-date  "$OBS_DATE"
+
+  # ─────────────────────────────────────────────────────────
+  promote:
+    name: Promote Champion (Manual Approval Required)
+    runs-on: ubuntu-latest
+    needs: [train, promotion-gate]
+    environment: model-promotion   # Requires explicit approval
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-deploy
+          aws-region:     us-east-1
+
+      - name: Promote model in MLflow + DB
+        env:
+          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_URI }}
+          CANDIDATE_VERSION:   ${{ needs.train.outputs.candidate_version }}
+        run: |
+          pip install asyncpg mlflow
+          python - <<'EOF'
+          import mlflow, asyncio, asyncpg, os, json
+          from datetime import datetime, timezone
+
+          mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+          client = mlflow.tracking.MlflowClient()
+
+          # Archive current Production
+          for mv in client.get_latest_versions("churn_predictor", stages=["Production"]):
+              client.transition_model_version_stage("churn_predictor", mv.version, "Archived")
+              print(f"Archived: {mv.version}")
+
+          # Promote candidate
+          ver = os.environ["CANDIDATE_VERSION"]
+          client.transition_model_version_stage("churn_predictor", ver, "Production")
+          print(f"Promoted: {ver}")
+
+          async def update_db():
+              pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+              async with pool.acquire() as conn:
+                  await conn.execute(
+                      "UPDATE ml.model_registry SET stage='champion', promoted_at=now(), "
+                      "promoted_by='github_actions', promotion_notes=$1 WHERE model_version=$2",
+                      json.dumps({"workflow_run": "${{ github.run_id }}"}), ver
+                  )
+              await pool.close()
+
+          asyncio.run(update_db())
+          print("DB updated.")
+          EOF
+
+      - name: Trigger deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              workflow_id: 'deploy.yml',
+              ref: 'main',
+              inputs: { image_tag: 'latest' }
+            })

@@ -1,0 +1,187 @@
+name: CI — Lint, Type-Check, Tests
+
+on:
+  push:
+    branches: ["main", "develop", "feature/**"]
+  pull_request:
+    branches: ["main", "develop"]
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install lint tools
+        run: pip install ruff black isort
+
+      - name: Run Ruff (linting)
+        run: ruff check . --select=E,F,W,I --ignore=E501
+
+      - name: Check Black formatting
+        run: black --check .
+
+      - name: Check isort
+        run: isort --check-only .
+
+  # ─────────────────────────────────────────────────────────
+  type-check:
+    name: Type Check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r apps/api/requirements.txt
+          pip install mypy types-PyYAML
+
+      - name: Run mypy on API
+        run: mypy apps/api --ignore-missing-imports --no-strict-optional
+
+  # ─────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r apps/api/requirements.txt
+          pip install pytest pytest-asyncio pytest-cov
+
+      - name: Run unit tests (leakage + feature engineering + schemas)
+        run: |
+          pytest tests/unit/ \
+            -v \
+            --cov=apps/api \
+            --cov=ml \
+            --cov=pipelines \
+            --cov-report=xml \
+            --tb=short
+        env:
+          PYTHONPATH: "apps/api:ml:pipelines"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ─────────────────────────────────────────────────────────
+  leakage-gate:
+    name: Leakage Prevention Gate (must pass 100%)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install pytest
+
+      - name: Run leakage tests (must all pass — no --ignore)
+        run: pytest tests/unit/test_leakage.py -v --tb=long
+        env:
+          PYTHONPATH: "apps/api:ml:pipelines"
+
+  # ─────────────────────────────────────────────────────────
+  docker-build:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build API image
+        run: docker build -t churn-api:ci ./apps/api
+
+      - name: Check image size
+        run: |
+          SIZE=$(docker image inspect churn-api:ci --format='{{.Size}}')
+          echo "Image size: $SIZE bytes"
+          # Fail if image > 2GB
+          if [ "$SIZE" -gt 2147483648 ]; then
+            echo "ERROR: Docker image too large ($SIZE bytes > 2GB)"
+            exit 1
+          fi
+
+  # ─────────────────────────────────────────────────────
+  security-scan:
+    name: Security Scan (SAST + Dependency Audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install audit tools
+        run: pip install bandit pip-audit
+
+      - name: Bandit SAST scan (medium+ severity)
+        run: |
+          bandit -r apps/ ml/ pipelines/ \
+            -x tests/ \
+            --severity-level medium \
+            --confidence-level medium \
+            --format txt
+        # Will fail the build on any MEDIUM/HIGH finding
+
+      - name: pip-audit — API dependencies
+        run: pip-audit -r apps/api/requirements.txt --desc on
+
+      - name: pip-audit — Training dependencies
+        run: pip-audit -r ml/requirements.training.txt --desc on
+
+  # ─────────────────────────────────────────────────────
+  trivy-image-scan:
+    name: Trivy Container Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: docker-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image for scanning
+        run: docker build -t churn-api:scan ./apps/api
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'churn-api:scan'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'

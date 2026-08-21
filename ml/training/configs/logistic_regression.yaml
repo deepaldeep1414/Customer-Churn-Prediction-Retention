@@ -1,0 +1,7 @@
+# Logistic Regression baseline config
+algorithm: logistic_regression
+C: 1.0
+solver: lbfgs
+max_iter: 500
+class_weight: balanced
+random_state: 42

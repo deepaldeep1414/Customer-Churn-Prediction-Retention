@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "customer-churn-platform"
+version = "1.0.0"
+description = "Customer Churn Prediction & Retention Intelligence Platform"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+exclude = ["db/migrations", ".github"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+exclude = '''
+/(
+    db/migrations
+  | \.git
+  | \.venv
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip = ["db/migrations"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+no_strict_optional = true
+exclude = ["db/", "tests/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["apps/api", "ml", "pipelines"]
+omit = ["*/tests/*", "*/__init__.py", "*/migrations/*"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true

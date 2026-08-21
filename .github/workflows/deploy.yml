@@ -1,0 +1,86 @@
+name: Deploy to EC2
+
+on:
+  workflow_run:
+    workflows: ["Build & Push to ECR"]
+    types: [completed]
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy"
+        required: true
+        default: "latest"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    environment: production   # Requires approval in GitHub Environments settings
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        run: |
+          TAG="${{ github.event.inputs.image_tag || 'latest' }}"
+          echo "DEPLOY_TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-deploy
+          aws-region:     us-east-1
+
+      - name: SSH deploy to EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host:        ${{ secrets.EC2_HOST }}
+          username:    ubuntu
+          key:         ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port:        22
+          script: |
+            set -e
+            cd /opt/churn
+
+            # Pull latest secrets from AWS Secrets Manager
+            aws secretsmanager get-secret-value \
+              --secret-id /churn/prod/env \
+              --query SecretString --output text > .env
+
+            # Login to ECR
+            aws ecr get-login-password --region us-east-1 | \
+              docker login --username AWS --password-stdin \
+              ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
+            # Pull new images
+            docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/churn/api:${{ env.DEPLOY_TAG }}
+
+            # Update running containers (zero-downtime replace)
+            MODEL_VERSION=${{ env.DEPLOY_TAG }} \
+              docker compose -f docker-compose.prod.yml up -d --no-deps api nginx
+
+            # Wait for health check
+            sleep 10
+            curl -f http://localhost:8000/health || exit 1
+
+            echo "Deployment successful: ${{ env.DEPLOY_TAG }}"
+
+      - name: Run post-deploy smoke tests
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key:      ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            cd /opt/churn
+            source .env
+            BASE_URL=http://localhost:8000 API_SECRET_KEY=$API_SECRET_KEY \
+              python -m pytest tests/smoke/ -v --tb=short

@@ -1,0 +1,208 @@
+# ============================================================
+# Feature Catalog Configuration
+# feature_set_version: v1.0.0
+# ============================================================
+#
+# Any change to feature definitions, window sizes, or encoding
+# MUST increment feature_set_version to prevent silent staleness.
+# ============================================================
+
+feature_set_version: "v1.0.0"
+
+observation_horizon:
+  default_days: 30
+  allowed_days: [7, 14, 30, 60, 90]
+
+features:
+  # ── Tenure ──────────────────────────────────────────────────
+  - name: tenure_months
+    type: numeric
+    group: tenure
+    source_table: curated.customers
+    source_column: signup_date
+    computation: "DATE_PART('month', AGE(observation_date, signup_date))::INTEGER"
+    leakage_risk: low
+    nullable: false
+
+  # ── Billing ─────────────────────────────────────────────────
+  - name: monthly_charges
+    type: numeric
+    group: billing
+    source_table: curated.billing
+    filter: "billing_period_end < observation_date ORDER BY billing_period_end DESC LIMIT 1"
+    leakage_risk: high
+    nullable: false
+
+  - name: total_charges
+    type: numeric
+    group: billing
+    source_table: curated.billing
+    filter: "billing_period_end < observation_date ORDER BY billing_period_end DESC LIMIT 1"
+    leakage_risk: high
+    nullable: false
+
+  - name: avg_monthly_charges_3m
+    type: numeric
+    group: billing
+    source_table: curated.billing
+    filter: "billing_period_end < observation_date AND billing_period_start >= observation_date - INTERVAL '3 months'"
+    computation: "AVG(monthly_charges)"
+    leakage_risk: high
+    nullable: true
+
+  - name: charge_change_pct_3m
+    type: numeric
+    group: billing
+    leakage_risk: high
+    nullable: true
+
+  - name: days_overdue_last
+    type: numeric
+    group: billing
+    source_table: curated.billing
+    filter: "billing_period_end < observation_date ORDER BY billing_period_end DESC LIMIT 1"
+    source_column: days_overdue
+    leakage_risk: high
+    nullable: false
+    default: 0
+
+  # ── Contract / Payment ────────────────────────────────────
+  - name: contract_type
+    type: categorical
+    group: contract
+    source_table: curated.subscriptions
+    source_column: contract_type
+    encoding: ordinal
+    categories: ["month-to-month", "one_year", "two_year"]
+    leakage_risk: low
+    nullable: false
+
+  - name: payment_method
+    type: categorical
+    group: contract
+    source_table: curated.billing
+    source_column: payment_method
+    encoding: onehot
+    leakage_risk: low
+    nullable: false
+
+  - name: paperless_billing
+    type: boolean
+    group: contract
+    source_table: curated.billing
+    source_column: paperless_billing
+    leakage_risk: low
+    nullable: false
+
+  # ── Service Flags ─────────────────────────────────────────
+  - name: phone_service
+    type: boolean
+    group: services
+    source_table: curated.services
+    source_column: phone_service
+    scd_join: "effective_from <= observation_date AND (effective_to IS NULL OR effective_to > observation_date)"
+    leakage_risk: medium
+    nullable: false
+
+  - name: internet_service
+    type: categorical
+    group: services
+    source_table: curated.services
+    source_column: internet_service
+    encoding: onehot
+    categories: ["dsl", "fiber_optic", "none"]
+    scd_join: "effective_from <= observation_date AND (effective_to IS NULL OR effective_to > observation_date)"
+    leakage_risk: medium
+    nullable: true
+
+  - name: addon_count
+    type: numeric
+    group: services
+    computation: "SUM of boolean addon columns (online_security + online_backup + device_protection + tech_support + streaming_tv + streaming_movies)"
+    leakage_risk: medium
+    nullable: false
+    default: 0
+
+  # ── Support / Tickets ────────────────────────────────────
+  - name: tickets_30d
+    type: numeric
+    group: support
+    source_table: curated.support_events
+    filter: "opened_at < observation_date AND opened_at >= observation_date - INTERVAL '30 days'"
+    computation: "COUNT(*)"
+    leakage_risk: high
+    nullable: false
+    default: 0
+
+  - name: tickets_90d
+    type: numeric
+    group: support
+    source_table: curated.support_events
+    filter: "opened_at < observation_date AND opened_at >= observation_date - INTERVAL '90 days'"
+    computation: "COUNT(*)"
+    leakage_risk: high
+    nullable: false
+    default: 0
+
+  - name: tickets_total
+    type: numeric
+    group: support
+    source_table: curated.support_events
+    filter: "opened_at < observation_date"
+    computation: "COUNT(*)"
+    leakage_risk: high
+    nullable: false
+    default: 0
+
+  - name: days_since_last_ticket
+    type: numeric
+    group: support
+    source_table: curated.support_events
+    filter: "opened_at < observation_date"
+    computation: "EXTRACT(DAY FROM observation_date - MAX(opened_at))"
+    leakage_risk: high
+    nullable: true
+
+  - name: pct_billing_tickets_90d
+    type: numeric
+    group: support
+    range: [0.0, 1.0]
+    leakage_risk: high
+    nullable: true
+
+  - name: pct_cancel_tickets_90d
+    type: numeric
+    group: support
+    range: [0.0, 1.0]
+    leakage_risk: high
+    nullable: true
+
+  - name: avg_csat_90d
+    type: numeric
+    group: support
+    range: [1.0, 5.0]
+    leakage_risk: high
+    nullable: true
+
+  # ── Interaction Features ──────────────────────────────────
+  - name: charge_x_tenure
+    type: numeric
+    group: interaction
+    computation: "monthly_charges * tenure_months"
+    leakage_risk: medium
+    nullable: true
+
+  - name: overdue_x_cancel_intent
+    type: numeric
+    group: interaction
+    computation: "days_overdue_last * pct_cancel_tickets_90d"
+    leakage_risk: medium
+    nullable: true
+
+leakage_prevention:
+  rules:
+    - "All event timestamps must use strict < observation_date comparisons"
+    - "No column from curated.churn_labels may appear in any feature query"
+    - "SCD-2 tables use effective_from <= observation_date AND (effective_to IS NULL OR effective_to > observation_date)"
+    - "Feature snapshots are write-once; never updated after creation"
+    - "Train/val/test splits are temporal; no shuffling across time boundaries"

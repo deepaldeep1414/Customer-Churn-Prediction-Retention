@@ -1,0 +1,125 @@
+name: Model Promotion Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: "MLflow run_id of the candidate model"
+        required: true
+      candidate_version:
+        description: "Model version to promote (e.g. 1.3.2)"
+        required: true
+      promotion_notes:
+        description: "Notes for the promotion audit log"
+        required: false
+
+jobs:
+  promotion-gate:
+    name: Validate & Promote Champion Model
+    runs-on: ubuntu-latest
+    environment: model-promotion   # Requires ML engineer approval
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install mlflow psycopg2-binary scikit-learn numpy
+
+      - name: Run automated promotion gates
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_URI }}
+          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+          CANDIDATE_RUN_ID:    ${{ github.event.inputs.candidate_run_id }}
+          CANDIDATE_VERSION:   ${{ github.event.inputs.candidate_version }}
+        run: |
+          python - <<'EOF'
+          import mlflow, os, sys
+          import numpy as np
+
+          mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+          client = mlflow.tracking.MlflowClient()
+          run    = client.get_run(os.environ["CANDIDATE_RUN_ID"])
+          metrics = run.data.metrics
+
+          failures = []
+
+          # Gate 1: Absolute PR-AUC floor
+          val_pr_auc = metrics.get("val_pr_auc", 0)
+          if val_pr_auc < 0.75:
+              failures.append(f"val_pr_auc={val_pr_auc:.4f} < floor 0.75")
+
+          # Gate 2: ECE calibration
+          val_ece = metrics.get("val_cal_ece")
+          if val_ece is not None and val_ece > 0.05:
+              failures.append(f"val_ece={val_ece:.4f} > max 0.05")
+
+          # Gate 3: Leakage tests must pass (checked in CI — assert ci_leakage_passed param)
+          # Checked in CI pipeline, not here.
+
+          if failures:
+              print("❌ PROMOTION GATE FAILED:")
+              for f in failures: print(f"   - {f}")
+              sys.exit(1)
+          else:
+              print("✅ All automated gates PASSED")
+              print(f"   val_pr_auc={val_pr_auc:.4f}")
+              if val_ece: print(f"   val_ece={val_ece:.4f}")
+          EOF
+
+      - name: Promote model in MLflow
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_URI }}
+          CANDIDATE_VERSION:   ${{ github.event.inputs.candidate_version }}
+          PROMOTED_BY:         ${{ github.actor }}
+        run: |
+          python - <<'EOF'
+          import mlflow, os
+          client = mlflow.tracking.MlflowClient()
+          mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+          model_name = "churn_predictor"
+          version    = os.environ["CANDIDATE_VERSION"]
+
+          # Archive current Production models
+          for mv in client.get_latest_versions(model_name, stages=["Production"]):
+              client.transition_model_version_stage(
+                  name=model_name, version=mv.version, stage="Archived"
+              )
+              print(f"Archived previous champion: {mv.version}")
+
+          # Promote candidate
+          client.transition_model_version_stage(
+              name=model_name, version=version, stage="Production"
+          )
+          client.update_model_version(
+              name=model_name, version=version,
+              description=f"Promoted by {os.environ['PROMOTED_BY']}: ${{ github.event.inputs.promotion_notes }}"
+          )
+          print(f"✅ Promoted model version {version} to Production")
+          EOF
+
+      - name: Log promotion to model_registry table
+        env:
+          DATABASE_URL:      ${{ secrets.DATABASE_URL }}
+          CANDIDATE_VERSION: ${{ github.event.inputs.candidate_version }}
+          PROMOTED_BY:       ${{ github.actor }}
+          PROMOTION_NOTES:   ${{ github.event.inputs.promotion_notes }}
+        run: |
+          python - <<'EOF'
+          import psycopg2, os
+          conn = psycopg2.connect(os.environ["DATABASE_URL"])
+          cur  = conn.cursor()
+          cur.execute("""
+              UPDATE ml.model_registry
+              SET stage = 'champion', promoted_at = now(),
+                  promoted_by = %s, promotion_notes = %s
+              WHERE model_version = %s
+          """, (os.environ["PROMOTED_BY"], os.environ.get("PROMOTION_NOTES", ""),
+                os.environ["CANDIDATE_VERSION"]))
+          conn.commit(); cur.close(); conn.close()
+          print("✅ DB model_registry updated")
+          EOF
